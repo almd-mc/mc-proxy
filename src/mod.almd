@@ -1,0 +1,270 @@
+// Minecraft proxy foundation for 1.21.1.
+// Corresponds to PrismarineJS/prismarine-proxy.
+//
+// Provides proxy logic: packet inspection, modification, filtering,
+// and routing between client and upstream server.
+//
+// Usage:
+//   import mc_proxy
+//   let config = mc_proxy.default_config()
+//   let rule = mc_proxy.block_packet(0x19)
+
+// --- Types ---
+
+type ProxyConfig = {
+  listen_host: String,
+  listen_port: Int,
+  upstream_host: String,
+  upstream_port: Int,
+  online_mode: Bool,
+  log_packets: Bool,
+}
+
+type Direction = | ClientToServer | ServerToClient
+
+type PacketFilter =
+  | PassThrough
+  | Block
+
+type PacketInfo = {
+  id: Int,
+  direction: Direction,
+  length: Int,
+}
+
+type ProxyRule = {
+  packet_id: Int,
+  direction: Direction,
+  action: PacketFilter,
+}
+
+type ProxyState = {
+  config: ProxyConfig,
+  rules: List[ProxyRule],
+  packets_forwarded: Int,
+  packets_blocked: Int,
+  is_running: Bool,
+}
+
+// --- Config ---
+
+fn default_config() -> ProxyConfig = {
+  {
+    listen_host: "0.0.0.0",
+    listen_port: 25566,
+    upstream_host: "localhost",
+    upstream_port: 25565,
+    online_mode: false,
+    log_packets: false,
+  }
+}
+
+// --- State ---
+
+fn new_state(config: ProxyConfig) -> ProxyState = {
+  { config: config, rules: [], packets_forwarded: 0, packets_blocked: 0, is_running: false }
+}
+
+fn start(state: ProxyState) -> ProxyState =
+  { ...state, is_running: true }
+
+fn stop(state: ProxyState) -> ProxyState =
+  { ...state, is_running: false }
+
+// --- Rules ---
+
+fn add_rule(state: ProxyState, rule: ProxyRule) -> ProxyState =
+  { ...state, rules: state.rules + [rule] }
+
+fn block_packet(packet_id: Int, direction: Direction) -> ProxyRule =
+  { packet_id: packet_id, direction: direction, action: Block }
+
+fn pass_packet(packet_id: Int, direction: Direction) -> ProxyRule =
+  { packet_id: packet_id, direction: direction, action: PassThrough }
+
+fn clear_rules(state: ProxyState) -> ProxyState =
+  { ...state, rules: [] }
+
+// --- Packet evaluation ---
+
+fn direction_eq(a: Direction, b: Direction) -> Bool = {
+  match a {
+    ClientToServer => match b { ClientToServer => true, _ => false },
+    ServerToClient => match b { ServerToClient => true, _ => false },
+  }
+}
+
+fn should_forward(state: ProxyState, packet: PacketInfo) -> Bool = {
+  let matching_rule = list.find(state.rules, (r) => r.packet_id == packet.id and direction_eq(r.direction, packet.direction))
+  match matching_rule {
+    none => true,
+    some(rule) => match rule.action {
+      PassThrough => true,
+      Block => false,
+    },
+  }
+}
+
+fn process_packet(state: ProxyState, packet: PacketInfo) -> ProxyState = {
+  if should_forward(state, packet) then
+    { ...state, packets_forwarded: state.packets_forwarded + 1 }
+  else
+    { ...state, packets_blocked: state.packets_blocked + 1 }
+}
+
+// --- Packet ID constants (common ones for filtering) ---
+
+// Play state - Client to Server
+let C2S_CHAT_MESSAGE = 0x06
+let C2S_CHAT_COMMAND = 0x04
+let C2S_PLAYER_POSITION = 0x1A
+let C2S_PLAYER_ROTATION = 0x1B
+let C2S_PLAYER_POSITION_AND_ROTATION = 0x1C
+let C2S_CLICK_CONTAINER = 0x0E
+let C2S_USE_ITEM = 0x38
+let C2S_PLAYER_ACTION = 0x24
+
+// Play state - Server to Client
+let S2C_CHAT_MESSAGE = 0x39
+let S2C_SYSTEM_CHAT = 0x6C
+let S2C_BLOCK_UPDATE = 0x09
+let S2C_CHUNK_DATA = 0x27
+let S2C_ENTITY_POSITION = 0x2E
+let S2C_PLAYER_POSITION = 0x40
+let S2C_KEEP_ALIVE = 0x26
+let S2C_DISCONNECT = 0x1D
+
+// --- Stats ---
+
+fn total_packets(state: ProxyState) -> Int =
+  state.packets_forwarded + state.packets_blocked
+
+fn block_rate(state: ProxyState) -> Float = {
+  let total = total_packets(state)
+  if total == 0 then 0.0
+  else int.to_float(state.packets_blocked) / int.to_float(total)
+}
+
+// --- Tests ---
+
+test "default_config" {
+  let config = default_config()
+  assert_eq(config.listen_port, 25566)
+  assert_eq(config.upstream_port, 25565)
+  assert_eq(config.online_mode, false)
+}
+
+test "new_state" {
+  let state = new_state(default_config())
+  assert_eq(state.packets_forwarded, 0)
+  assert_eq(state.packets_blocked, 0)
+  assert(not state.is_running)
+}
+
+test "start and stop" {
+  let state = new_state(default_config())
+  let running = start(state)
+  assert(running.is_running)
+  let stopped = stop(running)
+  assert(not stopped.is_running)
+}
+
+test "block_packet rule" {
+  let rule = block_packet(0x06, ClientToServer)
+  assert_eq(rule.packet_id, 0x06)
+  match rule.action {
+    Block => assert(true),
+    _ => assert(false),
+  }
+}
+
+test "should_forward - no rules" {
+  let state = new_state(default_config())
+  let pkt: PacketInfo = { id: 0x06, direction: ClientToServer, length: 10 }
+  assert(should_forward(state, pkt))
+}
+
+test "should_forward - blocked" {
+  let state = new_state(default_config())
+  let state2 = add_rule(state, block_packet(0x06, ClientToServer))
+  let pkt: PacketInfo = { id: 0x06, direction: ClientToServer, length: 10 }
+  assert(not should_forward(state2, pkt))
+}
+
+test "should_forward - different direction not blocked" {
+  let state = new_state(default_config())
+  let state2 = add_rule(state, block_packet(0x06, ClientToServer))
+  let pkt: PacketInfo = { id: 0x06, direction: ServerToClient, length: 10 }
+  assert(should_forward(state2, pkt))
+}
+
+test "should_forward - different id not blocked" {
+  let state = new_state(default_config())
+  let state2 = add_rule(state, block_packet(0x06, ClientToServer))
+  let pkt: PacketInfo = { id: 0x07, direction: ClientToServer, length: 10 }
+  assert(should_forward(state2, pkt))
+}
+
+test "process_packet - forwarded" {
+  let state = new_state(default_config())
+  let pkt: PacketInfo = { id: 0x06, direction: ClientToServer, length: 10 }
+  let s2 = process_packet(state, pkt)
+  assert_eq(s2.packets_forwarded, 1)
+  assert_eq(s2.packets_blocked, 0)
+}
+
+test "process_packet - blocked" {
+  let state = new_state(default_config())
+  let state2 = add_rule(state, block_packet(0x06, ClientToServer))
+  let pkt: PacketInfo = { id: 0x06, direction: ClientToServer, length: 10 }
+  let s3 = process_packet(state2, pkt)
+  assert_eq(s3.packets_forwarded, 0)
+  assert_eq(s3.packets_blocked, 1)
+}
+
+test "clear_rules" {
+  let state = new_state(default_config())
+  let state2 = add_rule(state, block_packet(0x06, ClientToServer))
+  assert_eq(list.length(state2.rules), 1)
+  let state3 = clear_rules(state2)
+  assert_eq(list.length(state3.rules), 0)
+}
+
+test "total_packets" {
+  let state = new_state(default_config())
+  let state2 = { ...state, packets_forwarded: 10, packets_blocked: 5 }
+  assert_eq(total_packets(state2), 15)
+}
+
+test "block_rate" {
+  let state = new_state(default_config())
+  assert_eq(block_rate(state), 0.0)
+  let state2 = { ...state, packets_forwarded: 7, packets_blocked: 3 }
+  let rate = block_rate(state2)
+  assert(rate > 0.29)
+  assert(rate < 0.31)
+}
+
+test "direction_eq" {
+  assert(direction_eq(ClientToServer, ClientToServer))
+  assert(direction_eq(ServerToClient, ServerToClient))
+  assert(not direction_eq(ClientToServer, ServerToClient))
+}
+
+test "packet constants" {
+  assert_eq(C2S_CHAT_MESSAGE, 0x06)
+  assert_eq(S2C_KEEP_ALIVE, 0x26)
+  assert_eq(S2C_DISCONNECT, 0x1D)
+}
+
+test "multiple rules" {
+  let state = new_state(default_config())
+  let s2 = add_rule(add_rule(state, block_packet(0x06, ClientToServer)), block_packet(0x39, ServerToClient))
+  assert_eq(list.length(s2.rules), 2)
+  let chat_c2s: PacketInfo = { id: 0x06, direction: ClientToServer, length: 5 }
+  let chat_s2c: PacketInfo = { id: 0x39, direction: ServerToClient, length: 5 }
+  let other: PacketInfo = { id: 0x09, direction: ServerToClient, length: 5 }
+  assert(not should_forward(s2, chat_c2s))
+  assert(not should_forward(s2, chat_s2c))
+  assert(should_forward(s2, other))
+}
