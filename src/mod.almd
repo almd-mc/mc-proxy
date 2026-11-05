@@ -142,7 +142,7 @@ fn total_packets(state: ProxyState) -> Int =
 fn block_rate(state: ProxyState) -> Float = {
   let total = total_packets(state)
   if total == 0 then 0.0
-  else int.to_float(state.packets_blocked) / int.to_float(total)
+  else float.from(state.packets_blocked) / float.from(total)
 }
 
 // --- Tests ---
